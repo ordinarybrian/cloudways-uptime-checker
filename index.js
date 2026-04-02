@@ -1,25 +1,203 @@
-import fetch from "node-fetch";
 import "dotenv/config";
+import fetch from "node-fetch";
+import Database from "better-sqlite3";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // --- Configuration ---
-const CLOUDWAYS_API_BASE = "https://api.cloudways.com/api/v2";
+const CLOUDWAYS_API_BASE = "https://api.cloudways.com/api/v1";
 const CLOUDWAYS_EMAIL = process.env.CLOUDWAYS_EMAIL;
 const CLOUDWAYS_API_KEY = process.env.CLOUDWAYS_API_KEY;
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
+const MUTED_PROJECT_IDS = (process.env.MUTED_PROJECT_IDS ?? "")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean);
+
+const DB_PATH = join(__dirname, "uptime.db");
+
+// --- Database setup ---
+function initDb() {
+  const db = new Database(DB_PATH);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS checks (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      domain       TEXT NOT NULL,
+      app_label    TEXT NOT NULL,
+      server_label TEXT NOT NULL,
+      timestamp    TEXT NOT NULL,
+      ok           INTEGER NOT NULL,
+      status_code  INTEGER,
+      error        TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS outages (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      domain       TEXT NOT NULL,
+      app_label    TEXT NOT NULL,
+      server_label TEXT NOT NULL,
+      timestamp    TEXT NOT NULL,
+      all_errors   TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_checks_domain_timestamp
+      ON checks (domain, timestamp);
+  `);
+
+  return db;
+}
+
+// --- Prune old data ---
+function pruneOldData(db) {
+  const checksDeleted = db
+    .prepare(
+      `DELETE FROM checks WHERE timestamp < datetime('now', '-6 months')`,
+    )
+    .run();
+  const outagesDeleted = db
+    .prepare(
+      `DELETE FROM outages WHERE timestamp < datetime('now', '-30 days')`,
+    )
+    .run();
+
+  if (checksDeleted.changes > 0 || outagesDeleted.changes > 0) {
+    console.log(
+      `🗑️  Pruned ${checksDeleted.changes} old check(s) and ${outagesDeleted.changes} old outage(s).`,
+    );
+  }
+}
+
+// --- Save check results ---
+function saveChecks(db, results) {
+  const insert = db.prepare(`
+    INSERT INTO checks (domain, app_label, server_label, timestamp, ok, status_code, error)
+    VALUES (@domain, @app_label, @server_label, @timestamp, @ok, @status_code, @error)
+  `);
+
+  const insertMany = db.transaction((rows) => {
+    for (const row of rows) insert.run(row);
+  });
+
+  const timestamp = new Date().toISOString();
+  insertMany(
+    results.map((r) => ({
+      domain: r.domain,
+      app_label: r.appLabel,
+      server_label: r.serverLabel,
+      timestamp,
+      ok: r.ok ? 1 : 0,
+      status_code: r.status ?? null,
+      error: r.error ?? null,
+    })),
+  );
+}
+
+// --- Save a confirmed outage ---
+function saveOutage(db, failure) {
+  const allErrors = failure.allErrors
+    ? failure.allErrors.join(" | ")
+    : (failure.error ?? `HTTP ${failure.status}`);
+
+  db.prepare(
+    `
+    INSERT INTO outages (domain, app_label, server_label, timestamp, all_errors)
+    VALUES (@domain, @app_label, @server_label, @timestamp, @all_errors)
+  `,
+  ).run({
+    domain: failure.domain,
+    app_label: failure.appLabel,
+    server_label: failure.serverLabel,
+    timestamp: new Date().toISOString(),
+    all_errors: allErrors,
+  });
+}
+
+// --- Calculate and log uptime summary ---
+function logUptimeSummary(db) {
+  const windows = [
+    { label: "24 hours", interval: "-1 day" },
+    { label: "7 days", interval: "-7 days" },
+    { label: "30 days", interval: "-30 days" },
+    { label: "6 months", interval: "-6 months" },
+    { label: "all time", interval: null },
+  ];
+
+  const domains = db
+    .prepare(`SELECT DISTINCT domain, app_label FROM checks ORDER BY domain`)
+    .all();
+
+  if (domains.length === 0) return;
+
+  console.log("\n📊 Uptime Summary:");
+
+  for (const { domain, app_label } of domains) {
+    console.log(`\n  ${app_label} (${domain})`);
+
+    for (const { label, interval } of windows) {
+      const query = interval
+        ? `SELECT COUNT(*) as total, SUM(ok) as successful FROM checks
+           WHERE domain = ? AND timestamp > datetime('now', '${interval}')`
+        : `SELECT COUNT(*) as total, SUM(ok) as successful FROM checks
+           WHERE domain = ?`;
+
+      const row = db.prepare(query).get(domain);
+
+      if (!row.total) {
+        console.log(`    ${label.padEnd(10)}: no data`);
+      } else {
+        const pct = ((row.successful / row.total) * 100).toFixed(2);
+        console.log(
+          `    ${label.padEnd(10)}: ${pct}% (${row.successful}/${row.total} checks)`,
+        );
+      }
+    }
+  }
+
+  // Overall uptime across all domains
+  console.log("\n  Overall (all domains)");
+  for (const { label, interval } of windows) {
+    const query = interval
+      ? `SELECT COUNT(*) as total, SUM(ok) as successful FROM checks
+         WHERE timestamp > datetime('now', '${interval}')`
+      : `SELECT COUNT(*) as total, SUM(ok) as successful FROM checks`;
+
+    const row = db.prepare(query).get();
+
+    if (!row.total) {
+      console.log(`    ${label.padEnd(10)}: no data`);
+    } else {
+      const pct = ((row.successful / row.total) * 100).toFixed(2);
+      console.log(
+        `    ${label.padEnd(10)}: ${pct}% (${row.successful}/${row.total} checks)`,
+      );
+    }
+  }
+
+  console.log("");
+}
 
 // --- Cloudways Auth: Get Bearer Token ---
 async function getAuthToken() {
-  const res = await fetch(`${CLOUDWAYS_API_BASE}/oauth/access_token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      email: CLOUDWAYS_EMAIL,
-      api_key: CLOUDWAYS_API_KEY,
-    }),
+  const params = new URLSearchParams({
+    email: CLOUDWAYS_EMAIL,
+    api_key: CLOUDWAYS_API_KEY,
   });
 
+  const res = await fetch(
+    `${CLOUDWAYS_API_BASE}/oauth/access_token?${params}`,
+    {
+      method: "POST",
+    },
+  );
+
   if (!res.ok) {
-    throw new Error(`Cloudways auth failed: ${res.status} ${res.statusText}`);
+    const body = await res.text();
+    throw new Error(
+      `Cloudways auth failed: ${res.status} ${res.statusText} — ${body}`,
+    );
   }
 
   const data = await res.json();
@@ -37,7 +215,7 @@ async function getServersAndApps(token) {
   }
 
   const data = await res.json();
-  return data.servers; // array of server objects, each with an `apps` array
+  return data.servers;
 }
 
 // --- Extract primary CNAME domain for each app ---
@@ -46,6 +224,12 @@ function extractDomains(servers) {
 
   for (const server of servers) {
     for (const app of server.apps ?? []) {
+      if (MUTED_PROJECT_IDS.includes(app.project_id)) {
+        console.log(
+          `  🔇  ${app.label} is muted (project ${app.project_id}), skipping.`,
+        );
+        continue;
+      }
       const cname = app.cname ?? app.application?.cname;
       if (cname) {
         domains.push({
@@ -108,7 +292,6 @@ async function checkDomain({ serverLabel, appLabel, domain }) {
         prev.status && current.status && prev.status === current.status;
 
       if (sameError || sameStatus) {
-        // Same error twice — confirmed down, no need for a 3rd attempt
         return {
           serverLabel,
           appLabel,
@@ -176,6 +359,9 @@ async function sendSlackAlert(failures) {
 async function main() {
   console.log("Starting uptime check...");
 
+  const db = initDb();
+  pruneOldData(db);
+
   const token = await getAuthToken();
   console.log("Authenticated with Cloudways.");
 
@@ -187,6 +373,9 @@ async function main() {
 
   // Check all domains in parallel
   const results = await Promise.all(domainEntries.map(checkDomain));
+
+  // Save all check results to the database
+  saveChecks(db, results);
 
   // Report results
   for (const r of results) {
@@ -201,8 +390,16 @@ async function main() {
     console.log("All sites are up!");
   } else {
     console.log(`${failures.length} site(s) are down. Sending Slack alert...`);
+    for (const failure of failures) {
+      saveOutage(db, failure);
+    }
     await sendSlackAlert(failures);
   }
+
+  // Print uptime summary
+  logUptimeSummary(db);
+
+  db.close();
 }
 
 main().catch((err) => {
